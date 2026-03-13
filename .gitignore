@@ -5,3 +5,7 @@ server/.env
 grafana-data
 
 seed_data/*
+
+health-auto-export-mcp/node_modules
+health-auto-export-mcp/dist
+health-auto-export-mcp/.env
