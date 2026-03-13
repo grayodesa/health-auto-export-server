@@ -142,6 +142,126 @@ export const getLatestMetric = async (req: Request, res: Response) => {
   }
 };
 
+export const getMetricDaily = async (req: Request, res: Response) => {
+  try {
+    const selectedMetric = req.params.selected_metric as MetricName;
+    const fromDate = parseDate(req.query.from as string);
+    const toDate = parseDate(req.query.to as string);
+
+    if (!selectedMetric) {
+      throw new Error('No metric selected');
+    }
+
+    const matchStage: any = {};
+    if (fromDate && toDate) {
+      matchStage.date = { $gte: fromDate, $lte: toDate };
+    } else if (fromDate) {
+      matchStage.date = { $gte: fromDate };
+    } else if (toDate) {
+      matchStage.date = { $lte: toDate };
+    }
+
+    const db = mongoose.connection.db;
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
+
+    const collection = db.collection(selectedMetric);
+
+    // Get units from latest record
+    const latestRecord = await collection.findOne({}, { sort: { date: -1 } });
+    const units = latestRecord?.units || null;
+
+    // Unit conversion factors to metric
+    const unitConversions: Record<string, { factor: number; targetUnit: string }> = {
+      'fl_oz_us': { factor: 29.5735, targetUnit: 'ml' },
+      'oz': { factor: 28.3495, targetUnit: 'g' },
+      'lb': { factor: 453.592, targetUnit: 'g' },
+    };
+    const conversion = units ? unitConversions[units] : null;
+
+    let groupFields: any;
+    let projectFields: any;
+
+    switch (selectedMetric) {
+      case MetricName.HEART_RATE:
+        groupFields = {
+          min: { $min: '$Min' },
+          avg: { $avg: '$Avg' },
+          max: { $max: '$Max' },
+        };
+        projectFields = { date: '$_id', min: 1, avg: { $round: ['$avg', 1] }, max: 1, _id: 0 };
+        break;
+      case MetricName.BLOOD_PRESSURE:
+        groupFields = {
+          systolic: { $avg: '$systolic' },
+          diastolic: { $avg: '$diastolic' },
+        };
+        projectFields = {
+          date: '$_id',
+          systolic: { $round: ['$systolic', 0] },
+          diastolic: { $round: ['$diastolic', 0] },
+          _id: 0,
+        };
+        break;
+      case MetricName.SLEEP_ANALYSIS:
+        groupFields = {
+          core: { $sum: '$core' },
+          rem: { $sum: '$rem' },
+          deep: { $sum: '$deep' },
+          awake: { $sum: '$awake' },
+          inBed: { $sum: '$inBed' },
+        };
+        projectFields = {
+          date: '$_id',
+          core: { $round: ['$core', 0] },
+          rem: { $round: ['$rem', 0] },
+          deep: { $round: ['$deep', 0] },
+          awake: { $round: ['$awake', 0] },
+          inBed: { $round: ['$inBed', 0] },
+          _id: 0,
+        };
+        break;
+      default:
+        groupFields = { qty: { $sum: '$qty' } };
+        if (conversion) {
+          projectFields = {
+            date: '$_id',
+            qty: { $round: [{ $multiply: ['$qty', conversion.factor] }, 1] },
+            _id: 0,
+          };
+        } else {
+          projectFields = { date: '$_id', qty: { $round: ['$qty', 1] }, _id: 0 };
+        }
+    }
+
+    const pipeline = [
+      { $match: matchStage },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: '%Y-%m-%d', date: '$date' },
+          },
+          ...groupFields,
+        },
+      },
+      { $project: projectFields },
+      { $sort: { date: 1 as const } },
+    ];
+
+    const results = await collection.aggregate(pipeline).toArray();
+
+    res.json({
+      metric: selectedMetric,
+      units: conversion ? conversion.targetUnit : units,
+      data: results,
+    });
+  } catch (error) {
+    console.error('Error getting daily metric:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Error getting daily metric' });
+  }
+};
+
 export const getMetricSummary = async (req: Request, res: Response) => {
   try {
     const selectedMetric = req.params.selected_metric as MetricName;
