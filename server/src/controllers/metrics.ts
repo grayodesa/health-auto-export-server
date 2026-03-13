@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 
 import { IngestData } from '../models/IngestData';
 import { IngestResponse } from '../models/IngestResponse';
@@ -61,11 +62,264 @@ export const getMetrics = async (req: Request, res: Response) => {
       metrics = metrics.map(metric => filterFields(metric, include, exclude));
     }
 
-    console.log(metrics);
     res.json(metrics);
   } catch (error) {
     console.error('Error getting metrics:', error);
     res.json({ error: error instanceof Error ? error.message : 'Error getting metrics' });
+  }
+};
+
+export const getAvailableMetrics = async (req: Request, res: Response) => {
+  try {
+    const db = mongoose.connection.db;
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
+
+    const collections = await db.listCollections().toArray();
+    const excludeNames = new Set(['workouts', 'workout_routes']);
+
+    const metricCollections = collections.filter(
+      (c) => !excludeNames.has(c.name) && !c.name.startsWith('system.'),
+    );
+
+    const metricsInfo = await Promise.all(
+      metricCollections.map(async (col) => {
+        const collection = db.collection(col.name);
+        const [count, oldest, newest] = await Promise.all([
+          collection.countDocuments(),
+          collection.findOne({}, { sort: { date: 1 }, projection: { date: 1 } }),
+          collection.findOne({}, { sort: { date: -1 }, projection: { date: 1 } }),
+        ]);
+
+        return {
+          name: col.name,
+          count,
+          firstDate: oldest?.date || null,
+          lastDate: newest?.date || null,
+        };
+      }),
+    );
+
+    metricsInfo.sort((a, b) => b.count - a.count);
+
+    res.json({ total: metricsInfo.length, metrics: metricsInfo });
+  } catch (error) {
+    console.error('Error getting available metrics:', error);
+    res.status(500).json({ error: 'Error getting available metrics' });
+  }
+};
+
+export const getLatestMetric = async (req: Request, res: Response) => {
+  try {
+    const selectedMetric = req.params.selected_metric as MetricName;
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 1, 1), 100);
+
+    if (!selectedMetric) {
+      throw new Error('No metric selected');
+    }
+
+    let metrics;
+
+    switch (selectedMetric) {
+      case MetricName.BLOOD_PRESSURE:
+        metrics = await BloodPressureModel.find({}).sort({ date: -1 }).limit(limit).lean();
+        break;
+      case MetricName.HEART_RATE:
+        metrics = await HeartRateModel.find({}).sort({ date: -1 }).limit(limit).lean();
+        break;
+      case MetricName.SLEEP_ANALYSIS:
+        metrics = await SleepModel.find({}).sort({ date: -1 }).limit(limit).lean();
+        break;
+      default:
+        metrics = await createMetricModel(selectedMetric).find({}).sort({ date: -1 }).limit(limit).lean();
+    }
+
+    res.json(metrics);
+  } catch (error) {
+    console.error('Error getting latest metric:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Error getting latest metric' });
+  }
+};
+
+export const getMetricSummary = async (req: Request, res: Response) => {
+  try {
+    const selectedMetric = req.params.selected_metric as MetricName;
+    const fromDate = parseDate(req.query.from as string);
+    const toDate = parseDate(req.query.to as string);
+
+    if (!selectedMetric) {
+      throw new Error('No metric selected');
+    }
+
+    const matchStage: any = {};
+    if (fromDate && toDate) {
+      matchStage.date = { $gte: fromDate, $lte: toDate };
+    } else if (fromDate) {
+      matchStage.date = { $gte: fromDate };
+    } else if (toDate) {
+      matchStage.date = { $lte: toDate };
+    }
+
+    const db = mongoose.connection.db;
+    if (!db) {
+      return res.status(503).json({ error: 'Database not connected' });
+    }
+
+    const collection = db.collection(selectedMetric);
+
+    // Get units from latest record
+    const latestRecord = await collection.findOne({}, { sort: { date: -1 } });
+    const units = latestRecord?.units || null;
+
+    let result: any;
+
+    switch (selectedMetric) {
+      case MetricName.BLOOD_PRESSURE: {
+        const agg = await collection
+          .aggregate([
+            { $match: matchStage },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                systolic_avg: { $avg: '$systolic' },
+                systolic_min: { $min: '$systolic' },
+                systolic_max: { $max: '$systolic' },
+                diastolic_avg: { $avg: '$diastolic' },
+                diastolic_min: { $min: '$diastolic' },
+                diastolic_max: { $max: '$diastolic' },
+              },
+            },
+          ])
+          .toArray();
+
+        const stats = agg[0];
+        result = {
+          metric: selectedMetric,
+          units,
+          count: stats?.count || 0,
+          period: { from: fromDate, to: toDate },
+          systolic: stats
+            ? { avg: Math.round(stats.systolic_avg * 100) / 100, min: stats.systolic_min, max: stats.systolic_max }
+            : null,
+          diastolic: stats
+            ? { avg: Math.round(stats.diastolic_avg * 100) / 100, min: stats.diastolic_min, max: stats.diastolic_max }
+            : null,
+        };
+        break;
+      }
+
+      case MetricName.HEART_RATE: {
+        const agg = await collection
+          .aggregate([
+            { $match: matchStage },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                min_avg: { $avg: '$Min' },
+                min_min: { $min: '$Min' },
+                avg_avg: { $avg: '$Avg' },
+                max_max: { $max: '$Max' },
+                max_avg: { $avg: '$Max' },
+              },
+            },
+          ])
+          .toArray();
+
+        const stats = agg[0];
+        result = {
+          metric: selectedMetric,
+          units,
+          count: stats?.count || 0,
+          period: { from: fromDate, to: toDate },
+          Min: stats
+            ? { avg: Math.round(stats.min_avg * 100) / 100, min: stats.min_min }
+            : null,
+          Avg: stats
+            ? { avg: Math.round(stats.avg_avg * 100) / 100 }
+            : null,
+          Max: stats
+            ? { avg: Math.round(stats.max_avg * 100) / 100, max: stats.max_max }
+            : null,
+        };
+        break;
+      }
+
+      case MetricName.SLEEP_ANALYSIS: {
+        const agg = await collection
+          .aggregate([
+            { $match: matchStage },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                core_avg: { $avg: '$core' },
+                rem_avg: { $avg: '$rem' },
+                deep_avg: { $avg: '$deep' },
+                awake_avg: { $avg: '$awake' },
+                inBed_avg: { $avg: '$inBed' },
+                core_sum: { $sum: '$core' },
+                rem_sum: { $sum: '$rem' },
+                deep_sum: { $sum: '$deep' },
+                awake_sum: { $sum: '$awake' },
+                inBed_sum: { $sum: '$inBed' },
+              },
+            },
+          ])
+          .toArray();
+
+        const stats = agg[0];
+        result = {
+          metric: selectedMetric,
+          units,
+          count: stats?.count || 0,
+          period: { from: fromDate, to: toDate },
+          core: stats ? { avg: Math.round(stats.core_avg * 100) / 100, total: stats.core_sum } : null,
+          rem: stats ? { avg: Math.round(stats.rem_avg * 100) / 100, total: stats.rem_sum } : null,
+          deep: stats ? { avg: Math.round(stats.deep_avg * 100) / 100, total: stats.deep_sum } : null,
+          awake: stats ? { avg: Math.round(stats.awake_avg * 100) / 100, total: stats.awake_sum } : null,
+          inBed: stats ? { avg: Math.round(stats.inBed_avg * 100) / 100, total: stats.inBed_sum } : null,
+        };
+        break;
+      }
+
+      default: {
+        const agg = await collection
+          .aggregate([
+            { $match: matchStage },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                avg: { $avg: '$qty' },
+                min: { $min: '$qty' },
+                max: { $max: '$qty' },
+                sum: { $sum: '$qty' },
+              },
+            },
+          ])
+          .toArray();
+
+        const stats = agg[0];
+        result = {
+          metric: selectedMetric,
+          units,
+          count: stats?.count || 0,
+          period: { from: fromDate, to: toDate },
+          avg: stats ? Math.round(stats.avg * 100) / 100 : null,
+          min: stats?.min ?? null,
+          max: stats?.max ?? null,
+          sum: stats?.sum ?? null,
+        };
+      }
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error getting metric summary:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Error getting metric summary' });
   }
 };
 

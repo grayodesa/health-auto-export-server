@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express from 'express';
+import mongoose from 'mongoose';
 
 import mongodb from './database/mongodb';
 import ingesterRouter from './routes/ingester';
@@ -15,13 +16,27 @@ mongodb.connect();
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'api-key'],
 };
 
 app.use(cors(corsOptions));
 
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ limit: '200mb', extended: true }));
+
+// Healthcheck endpoint (no auth required)
+app.get('/api/health', (req: express.Request, res: express.Response) => {
+  const dbState = mongoose.connection.readyState;
+  const status = dbState === 1 ? 'ok' : 'degraded';
+  const statusCode = dbState === 1 ? 200 : 503;
+
+  res.status(statusCode).json({
+    status,
+    database: dbState === 1 ? 'connected' : 'disconnected',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Apply write auth middleware to data ingestion routes
 app.use('/api/data', requireWriteAuth, ingesterRouter);
